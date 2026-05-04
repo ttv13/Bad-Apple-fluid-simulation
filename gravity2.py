@@ -15,12 +15,9 @@ import subprocess
 import sys
 import time
 
-# ============================================================
-# USER SETTINGS
-# ============================================================
 FRAME_FOLDER = Path(__file__).resolve().parent / "frames"
-OUTPUT_DIR = Path(__file__).resolve().parent / "rendered_frames"
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "bad_apple_render_checkpoint.pkl"
+OUTPUT_DIR = Path(__file__).resolve().parent / "rendered_frames4"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "bad_apple_render_checkpoint2.pkl"
 VIDEO_OUTPUT_PATH = Path(__file__).resolve().parent / "bad_apple_particles.mp4"
 
 WIDTH = 640
@@ -28,49 +25,43 @@ HEIGHT = 480
 FPS = 30
 THRESHOLD = 128
 
-# Rendering / output
 DRAW_VIDEO_BACKGROUND = False
 VIDEO_CRF = 18
 EXPORT_MP4_AT_END = True
 OVERWRITE_EXISTING_OUTPUT_IF_NOT_RESUMING = False
-MAX_VIDEO_FRAMES: int | None = None   # None = render full video
+MAX_VIDEO_FRAMES: int | None = None   
 
-# Particle system
-NUM_PARTICLES = 4000
+NUM_PARTICLES = 10000
 PARTICLE_RADIUS = 1
-SPAWN_STRIDE = 2                      # respawn/spawn sampling density
+SPAWN_STRIDE = 2                    
 INITIAL_SPEED_MIN = 80.0
 INITIAL_SPEED_MAX = 230.0
 
-# Physics: high precision defaults
-BASE_PHYSICS_STEPS_PER_VIDEO_FRAME = 120
+BASE_PHYSICS_STEPS_PER_VIDEO_FRAME = 120    
 MAX_PHYSICS_STEPS_PER_VIDEO_FRAME = 480
 MAX_PARTICLE_TRAVEL_PER_SUBSTEP = 0.20
-PARTICLE_COLLISION_ITERATIONS = 2
+BOUNDARY_SUBSTEP_PIXELS = 0.25
+PARTICLE_COLLISION_ITERATIONS = 3
 
-# Collisions
+
 BOUNDARY_RESTITUTION = 0.98
 PARTICLE_RESTITUTION = 0.99
 CELL_SIZE = max(PARTICLE_RADIUS * 4, 4)
 
-# Moving boundary sweep / frame-to-frame mask jumps
-MOVING_BOUNDARY_MAX_SWEEP_PIXELS = 120
-MOVING_BOUNDARY_PUSH_EPSILON = 1.25
-MOVING_BOUNDARY_MIN_INWARD_SPEED = 80.0
 
-# Checkpoint / resume
+MOVING_BOUNDARY_MAX_SWEEP_PIXELS = 160
+MOVING_BOUNDARY_PUSH_EPSILON = 1.25
+MOVING_BOUNDARY_MIN_INWARD_SPEED = 120
+
 RESUME_IF_CHECKPOINT_EXISTS = True
 CHECKPOINT_EVERY_N_FRAMES = 25
 FRAME_CACHE_SIZE = 4
 
-# Diagnostics
+
 PRINT_PROGRESS_EVERY_N_FRAMES = 1
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
-# ============================================================
-# DATA TYPES
-# ============================================================
 @dataclass(slots=True)
 class FrameData:
     mask_bytes: bytes
@@ -88,9 +79,6 @@ class Particle:
     vy: float
 
 
-# ============================================================
-# FRAME LOADING
-# ============================================================
 def natural_key(path: Path):
     return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", path.name)]
 
@@ -145,10 +133,6 @@ def load_frame_data(frame_index: int) -> FrameData:
         file_name=path.name,
     )
 
-
-# ============================================================
-# MASK HELPERS
-# ============================================================
 def is_inside(mask: bytes, x: float, y: float) -> bool:
     ix = int(x)
     iy = int(y)
@@ -210,9 +194,6 @@ def nearest_inside_point(mask: bytes, x: float, y: float, max_radius: int) -> tu
     return None
 
 
-# ============================================================
-# PARTICLE HELPERS
-# ============================================================
 def pick_spawn_point(frame: FrameData) -> tuple[float, float]:
     if not frame.white_points:
         raise RuntimeError("Cannot spawn a particle: frame has no valid white points.")
@@ -253,10 +234,6 @@ def respawn_particle(p: Particle, frame: FrameData) -> None:
     p.vx = fresh.vx
     p.vy = fresh.vy
 
-
-# ============================================================
-# PHYSICS
-# ============================================================
 def choose_physics_steps(particles: list[Particle]) -> int:
     if not particles:
         return BASE_PHYSICS_STEPS_PER_VIDEO_FRAME
@@ -282,7 +259,7 @@ def reflect_velocity(vx: float, vy: float, nx: float, ny: float, restitution: fl
     return (vx - 2.0 * dot * nx) * restitution, (vy - 2.0 * dot * ny) * restitution
 
 
-def move_particle_one_substep(p: Particle, frame: FrameData, dt: float) -> None:
+def move_particle_one_boundary_step(p: Particle, frame: FrameData, dt: float) -> None:
     old_x = p.x
     old_y = p.y
     new_x = p.x + p.vx * dt
@@ -308,7 +285,6 @@ def move_particle_one_substep(p: Particle, frame: FrameData, dt: float) -> None:
         new_y = max_y - (new_y - max_y)
         p.vy = -abs(p.vy) * BOUNDARY_RESTITUTION
 
-    # silhouette boundary using safe mask so full radius stays inside
     if frame.has_white and not is_inside(frame.safe_mask_bytes, new_x, new_y):
         nx, ny = inward_normal(frame.safe_mask_bytes, new_x, new_y)
         if nx == 0.0 and ny == 0.0:
@@ -329,6 +305,21 @@ def move_particle_one_substep(p: Particle, frame: FrameData, dt: float) -> None:
         p.y = max(min_y, min(max_y, new_y))
 
 
+def move_particle_one_substep(p: Particle, frame: FrameData, dt: float) -> None:
+    """
+    Moves a particle for one high-rate physics step.
+
+    Even inside that small dt, the path is subdivided by BOUNDARY_SUBSTEP_PIXELS.
+    This is extra protection against missing thin boundaries.
+    """
+    travel = math.hypot(p.vx * dt, p.vy * dt)
+    boundary_steps = max(1, math.ceil(travel / BOUNDARY_SUBSTEP_PIXELS))
+    small_dt = dt / boundary_steps
+
+    for _ in range(boundary_steps):
+        move_particle_one_boundary_step(p, frame, small_dt)
+
+
 def solve_particle_collisions(particles: list[Particle]) -> None:
     if len(particles) < 2:
         return
@@ -343,7 +334,6 @@ def solve_particle_collisions(particles: list[Particle]) -> None:
     neighbor_offsets = [(0, 0), (1, 0), (0, 1), (1, 1), (-1, 1)]
 
     for (cx, cy), here in grid.items():
-        # same-cell pairs
         count_here = len(here)
         for i in range(count_here):
             idx_a = here[i]
@@ -353,7 +343,6 @@ def solve_particle_collisions(particles: list[Particle]) -> None:
                 pb = particles[idx_b]
                 resolve_pair(pa, pb, min_dist, min_dist_sq)
 
-        # neighbor cells, half neighborhood only to avoid duplicate pairs
         for ox, oy in neighbor_offsets[1:]:
             other = grid.get((cx + ox, cy + oy))
             if not other:
@@ -389,7 +378,6 @@ def resolve_pair(pa: Particle, pb: Particle, min_dist: float, min_dist_sq: float
     pb.x += nx * correction
     pb.y += ny * correction
 
-    # equal mass impulse
     rvx = pb.vx - pa.vx
     rvy = pb.vy - pa.vy
     rel_normal = rvx * nx + rvy * ny
@@ -456,16 +444,12 @@ def reconcile_particles_with_frame_change(
                 swept_hits += 1
                 continue
 
-        # not recoverable as a swept boundary collision -> respawn
         respawn_particle(p, new_frame)
         respawns += 1
 
     return swept_hits, respawns
 
 
-# ============================================================
-# RENDERING
-# ============================================================
 def speed_to_color(speed: float) -> tuple[int, int, int]:
     t = max(0.0, min(speed / INITIAL_SPEED_MAX, 1.0))
     if t < 0.5:
@@ -483,7 +467,6 @@ def speed_to_color(speed: float) -> tuple[int, int, int]:
 
 def render_frame(frame: FrameData, particles: list[Particle], frame_index: int) -> Image.Image:
     if DRAW_VIDEO_BACKGROUND:
-        # reopen only when explicitly requested
         with Image.open(FRAME_PATHS[frame_index]) as img:
             canvas = img.convert("RGB").resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
     else:
@@ -516,9 +499,6 @@ def render_frame(frame: FrameData, particles: list[Particle], frame_index: int) 
     return canvas
 
 
-# ============================================================
-# CHECKPOINTING
-# ============================================================
 def particles_to_state(particles: list[Particle]) -> list[tuple[float, float, float, float]]:
     return [(p.x, p.y, p.vx, p.vy) for p in particles]
 
@@ -559,10 +539,6 @@ def try_load_checkpoint() -> tuple[int, list[Particle]] | None:
     random.setstate(state["random_state"])
     return next_frame_index, particles
 
-
-# ============================================================
-# EXPORT
-# ============================================================
 def export_mp4() -> None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -590,9 +566,6 @@ def export_mp4() -> None:
     print(f"[done] MP4 saved to: {VIDEO_OUTPUT_PATH}")
 
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
 def prepare_output_dir(start_index: int) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if start_index == 0 and OVERWRITE_EXISTING_OUTPUT_IF_NOT_RESUMING:
@@ -634,7 +607,6 @@ def run() -> None:
     for frame_index in range(start_frame_index, TOTAL_RENDER_FRAMES):
         frame = load_frame_data(frame_index)
 
-        # lazily create particles when the first non-black frame appears
         ensure_particles(frame, particles)
 
         swept_hits = 0
